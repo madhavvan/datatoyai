@@ -1,0 +1,28 @@
+pandas==2.2.3
+numpy==2.1.2
+openai==1.51.0
+dask==2024.10.0
+folium==0.17.0
+kaleido==0.2.1
+matplotlib==3.9.2
+networkx==3.3
+plotly==5.24.1
+seaborn==0.13.2
+wordcloud==1.9.3
+scipy==1.14.1
+scikit-learn==1.5.2  # Corrected from sklearn
+statsmodels==0.14.4
+requests==2.32.3
+ratelimit==2.2.1
+cryptography==43.0.1
+psycopg2-binary==2.9.9
+bcrypt==4.2.0
+authlib==1.3.2
+lightgbm==4.5.0
+xgboost==2.1.1
+lime==0.2.0.1
+shap==0.46.0
+dash==2.18.1  # Updated to latest version
+dash-bootstrap-components==1.6.0
+python-dotenv==1.0.1  # Added for environment variable management
+gunicorn==22.0.0  # Added for Azure App Service
