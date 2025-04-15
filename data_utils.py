@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import openai
 from openai import OpenAI
+import streamlit as st  # For compatibility with session_state
 import re
 from sklearn.preprocessing import LabelEncoder, PolynomialFeatures
 from sklearn.ensemble import IsolationForest, RandomForestRegressor, RandomForestClassifier
@@ -24,20 +25,25 @@ from datetime import datetime
 
 # Set up logging with rotation
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    handler = RotatingFileHandler('data_utils.log', maxBytes=5*1024*1024, backupCount=3)
+logger.setLevel(logging.INFO)  # Change to INFO for production
+if not logger.handlers:  # Avoid adding handlers multiple times
+    handler = RotatingFileHandler('data_utils.log', maxBytes=5*1024*1024, backupCount=3)  # 5MB per file, keep 3 backups
     handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     logger.addHandler(handler)
 
 # Securely load OpenAI API key
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    logger.error("OpenAI API key not found in environment variables.")
-    # Errors will be handled in Dash callbacks
-AI_AVAILABLE = bool(api_key)
+api_key = None
+try:
+    api_key = os.getenv("OPENAI_API_KEY")  # Use environment variable for Dash
+    if not api_key:
+        raise ValueError("OpenAI API key not found in environment variables.")
+    logger.info("Successfully loaded OPENAI_API_KEY")
+except Exception as e:
+    logger.error(f"Failed to load OpenAI API key: {str(e)}")
+    # Return error message instead of st.error
+    error_message = "OpenAI API key is missing. Please configure it as an environment variable to enable AI features."
 
-# Initialize OpenAI client
+# Initialize OpenAI client with error handling
 client = None
 if api_key:
     try:
@@ -46,7 +52,11 @@ if api_key:
         logger.info("OpenAI client initialized successfully with version: %s", openai.__version__)
     except Exception as e:
         logger.error(f"Failed to initialize OpenAI client: {str(e)}")
-        AI_AVAILABLE = False
+        error_message = "Failed to initialize OpenAI client. AI-driven features will be disabled."
+        client = None
+
+# Global flag for AI availability
+AI_AVAILABLE = client is not None
 
 # Encryption Setup
 ENCRYPTION_KEY = Fernet.generate_key()
@@ -92,7 +102,7 @@ def log_action(username: str, action: str):
     conn.commit()
     conn.close()
 
-# Rate limiting for OpenAI API calls
+# Rate limiting for OpenAI API calls (e.g., 10 calls per minute)
 CALLS_PER_MINUTE = 10
 @sleep_and_retry
 @limits(calls=CALLS_PER_MINUTE, period=60)
@@ -101,7 +111,18 @@ def rate_limited_api_call(func, *args, **kwargs):
     return func(*args, **kwargs)
 
 def detect_outliers(df: pd.DataFrame, col: str, method: str = "iqr", contamination: float = 0.1) -> Tuple[bool, float, float]:
-    """Detect outliers in a numeric column."""
+    """
+    Detect outliers in a numeric column using specified method (IQR or Isolation Forest).
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        col (str): Column to analyze.
+        method (str): Outlier detection method ("iqr" or "isolation_forest").
+        contamination (float): Contamination factor for Isolation Forest (0 to 0.5).
+
+    Returns:
+        Tuple[bool, float, float]: (has_outliers, lower_bound, upper_bound).
+    """
     try:
         if method == "iqr":
             Q1 = df[col].quantile(0.25)
@@ -126,9 +147,21 @@ def detect_outliers(df: pd.DataFrame, col: str, method: str = "iqr", contaminati
         return False, 0, 0
 
 def detect_anomalies(df: pd.DataFrame, cols: List[str], contamination: float = 0.1) -> Dict[str, Dict]:
-    """Detect anomalies in numerical columns."""
+    """
+    Detect anomalies in numerical columns using Isolation Forest with dynamic contamination.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        cols (List[str]): Columns to analyze.
+        contamination (float): Contamination factor (0 to 0.5).
+
+    Returns:
+        Dict[str, Dict]: Dictionary of anomalies per column.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
+
     anomalies = {}
     try:
         for col in cols:
@@ -142,12 +175,23 @@ def detect_anomalies(df: pd.DataFrame, cols: List[str], contamination: float = 0
                 logger.warning(f"No data available for anomaly detection in column {col}")
     except Exception as e:
         logger.error(f"Error in detect_anomalies: {str(e)}")
+        return {}
     return anomalies
 
 def analyze_dataset(df: pd.DataFrame) -> Dict[str, Union[int, List[str], bool]]:
-    """Analyze dataset properties."""
+    """
+    Analyze dataset properties for AI suggestions and health score.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+
+    Returns:
+        Dict[str, Union[int, List[str], bool]]: Analysis results.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
+
     try:
         analysis = {
             "has_question_marks": '?' in df.values,
@@ -159,6 +203,7 @@ def analyze_dataset(df: pd.DataFrame) -> Dict[str, Union[int, List[str], bool]]:
             "duplicates": df.duplicated().sum(),
             "time_cols": [col for col in df.columns if pd.api.types.is_datetime64_any_dtype(df[col])]
         }
+        # Add type analysis for AI-driven type correction
         analysis["type_issues"] = {}
         for col in df.columns:
             col_types = df[col].apply(type).nunique()
@@ -168,9 +213,10 @@ def analyze_dataset(df: pd.DataFrame) -> Dict[str, Union[int, List[str], bool]]:
                     "suggested_type": df[col].dtype.name if pd.api.types.is_numeric_dtype(df[col]) else "string"
                 }
             elif df[col].dtype == 'object':
+                # Check if object column can be converted to numeric
                 try:
                     numeric_series = pd.to_numeric(df[col], errors='coerce')
-                    if numeric_series.notna().mean() > 0.9:
+                    if numeric_series.notna().mean() > 0.9:  # 90% can be converted to numeric
                         analysis["type_issues"][col] = {
                             "mixed_types": False,
                             "suggested_type": "numeric"
@@ -183,9 +229,19 @@ def analyze_dataset(df: pd.DataFrame) -> Dict[str, Union[int, List[str], bool]]:
         return {}
 
 def calculate_health_score(df: pd.DataFrame) -> float:
-    """Calculate dataset health score."""
+    """
+    Calculate a dataset health score (0-100) based on quality metrics with weighted scoring.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+
+    Returns:
+        float: Health score (0-100).
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
+
     try:
         analysis = analyze_dataset(df)
         score = 100.0
@@ -215,13 +271,26 @@ def calculate_health_score(df: pd.DataFrame) -> float:
         return 0
 
 def get_cleaning_suggestions(df: pd.DataFrame) -> List[Tuple[str, str]]:
-    """Generate AI-driven cleaning suggestions."""
+    """
+    Generate AI-driven cleaning suggestions with explanations using GPT-4o.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+
+    Returns:
+        List[Tuple[str, str]]: List of (suggestion, explanation) tuples.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'  # Updated in app.py callbacks
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, "Generated cleaning suggestions")
-    if not AI_AVAILABLE:
-        return [("Manual cleaning required", "OpenAI API key not configured.")]
+
+    if not client:
+        return [("Manual cleaning required", "Please configure a valid OpenAI API key to enable AI suggestions.")]
+
     try:
         analysis = analyze_dataset(df)
         prompt = f"""
@@ -253,13 +322,26 @@ def get_cleaning_suggestions(df: pd.DataFrame) -> List[Tuple[str, str]]:
         return [("Error: Failed to generate suggestions", str(e))]
 
 def get_insights(df: pd.DataFrame) -> List[str]:
-    """Generate natural language insights."""
+    """
+    Generate natural language insights about the dataset using GPT-4o.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+
+    Returns:
+        List[str]: List of insights.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, "Generated insights")
-    if not AI_AVAILABLE:
-        return ["OpenAI API key not configured."]
+
+    if not client:
+        return ["Please configure a valid OpenAI API key to enable AI-driven insights."]
+
     try:
         prompt = """
         You are an AI data analyst. Analyze this dataset and provide 3-5 human-readable insights in plain English:
@@ -286,9 +368,19 @@ def get_insights(df: pd.DataFrame) -> List[str]:
         return [f"Error: Failed to generate insights - {str(e)}"]
 
 def suggest_visualization(df: pd.DataFrame) -> Tuple[str, str]:
-    """Suggest visualization type."""
+    """
+    Suggest the best visualization type based on data characteristics.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+
+    Returns:
+        Tuple[str, str]: (visualization_type, reason).
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
+
     try:
         analysis = analyze_dataset(df)
         if analysis["time_cols"]:
@@ -304,13 +396,26 @@ def suggest_visualization(df: pd.DataFrame) -> Tuple[str, str]:
         return "Bar", "Default suggestion due to error."
 
 def suggest_feature_engineering(df: pd.DataFrame) -> List[Tuple[str, str]]:
-    """Suggest new features."""
+    """
+    Suggest new features to engineer using GPT-4o based on dataset patterns.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+
+    Returns:
+        List[Tuple[str, str]]: List of (feature_suggestion, explanation) tuples.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, "Suggested feature engineering")
-    if not AI_AVAILABLE:
-        return [("Manual feature engineering required", "OpenAI API key not configured.")]
+
+    if not client:
+        return [("Manual feature engineering required", "Please configure a valid OpenAI API key to enable AI suggestions.")]
+
     try:
         analysis = analyze_dataset(df)
         prompt = """
@@ -341,7 +446,15 @@ def suggest_feature_engineering(df: pd.DataFrame) -> List[Tuple[str, str]]:
         return [("Error: Failed to suggest features", str(e))]
 
 def extract_column(suggestion: str) -> Optional[str]:
-    """Extract column name from suggestion."""
+    """
+    Extract column name from a suggestion string using regex.
+
+    Args:
+        suggestion (str): Suggestion text.
+
+    Returns:
+        Optional[str]: Extracted column name or None.
+    """
     try:
         match = re.search(r"in\s+['\"]?(.*?)['\"]?\s*(?:with|$)", suggestion)
         return match.group(1) if match else None
@@ -350,13 +463,27 @@ def extract_column(suggestion: str) -> Optional[str]:
         return None
 
 def enrich_with_geolocation(df: pd.DataFrame, address_col: str, api_key: Optional[str] = None) -> Tuple[pd.DataFrame, str]:
-    """Enrich dataset with geolocation."""
+    """
+    Enrich dataset with geolocation data using Google Maps API.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        address_col (str): Column with address data.
+        api_key (Optional[str]): Google Maps API key.
+
+    Returns:
+        Tuple[pd.DataFrame, str]: (Updated DataFrame, log message).
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, f"Enriched data with geolocation for column {address_col}")
+
     if not api_key:
-        return df, "No Google API key provided."
+        return df, "No Google API key provided. Please provide a valid API key to enable geolocation enrichment."
     try:
         df[f"{address_col}_lat"] = np.nan
         df[f"{address_col}_lon"] = np.nan
@@ -376,9 +503,20 @@ def enrich_with_geolocation(df: pd.DataFrame, address_col: str, api_key: Optiona
         return df, f"Geolocation enrichment failed: {str(e)}"
 
 def interpolate_time_series(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    """Interpolate missing values in time series."""
+    """
+    Interpolate missing values in a time series column.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        col (str): Column to interpolate.
+
+    Returns:
+        pd.DataFrame: Updated DataFrame.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
+
     try:
         df[col] = pd.to_numeric(df[col], errors='coerce')
         df[col] = df[col].interpolate(method='linear')
@@ -388,9 +526,21 @@ def interpolate_time_series(df: pd.DataFrame, col: str) -> pd.DataFrame:
         return df
 
 def analyze_time_series(df: pd.DataFrame, col: str, period: int = 12) -> Dict[str, pd.Series]:
-    """Analyze time series."""
+    """
+    Analyze time series for trends, seasonality, and residuals.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        col (str): Column to analyze.
+        period (int): Period for decomposition.
+
+    Returns:
+        Dict[str, pd.Series]: Decomposition components.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
+
     try:
         df[col] = pd.to_numeric(df[col], errors='coerce')
         decomposition = seasonal_decompose(df[col].dropna(), model='additive', period=period)
@@ -404,11 +554,27 @@ def analyze_time_series(df: pd.DataFrame, col: str, period: int = 12) -> Dict[st
         return {}
 
 def forecast_time_series(df: pd.DataFrame, col: str, periods: int = 5, time_col: Optional[str] = None, freq: str = 'D') -> pd.DataFrame:
-    """Forecast time series."""
+    """
+    Forecast future values for a time series column with dynamic frequency.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        col (str): Column to forecast.
+        periods (int): Number of periods to forecast.
+        time_col (Optional[str]): Time column for index.
+        freq (str): Frequency of the time series ('D', 'M', etc.).
+
+    Returns:
+        pd.DataFrame: Forecasted values.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, f"Performed time series forecast for column {col}")
+
     try:
         if time_col and time_col in df.columns:
             df = df.set_index(time_col)
@@ -424,11 +590,24 @@ def forecast_time_series(df: pd.DataFrame, col: str, periods: int = 5, time_col:
         return pd.DataFrame()
 
 def generate_synthetic_data(df: pd.DataFrame, task_type: str = "classification") -> pd.DataFrame:
-    """Generate synthetic data."""
+    """
+    Generate synthetic data based on the dataset's structure with realistic distributions.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        task_type (str): Type of task ("classification" or "regression").
+
+    Returns:
+        pd.DataFrame: Synthetic dataset.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, f"Generated synthetic data for {task_type} task")
+
     try:
         n_samples = len(df)
         n_features = len(df.columns) - 1
@@ -436,6 +615,7 @@ def generate_synthetic_data(df: pd.DataFrame, task_type: str = "classification")
             X, y = make_classification(n_samples=n_samples, n_features=n_features, n_informative=max(2, n_features-2), random_state=42)
         else:
             X, y = make_regression(n_samples=n_samples, n_features=n_features, noise=0.1, random_state=42)
+        
         synthetic_df = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(n_features)])
         synthetic_df["target"] = y
         return synthetic_df
@@ -444,9 +624,21 @@ def generate_synthetic_data(df: pd.DataFrame, task_type: str = "classification")
         return pd.DataFrame()
 
 def auto_feature_engineering(df: pd.DataFrame, feature_cols: List[str], degree: int = 2) -> pd.DataFrame:
-    """Generate new features."""
+    """
+    Automatically generate new features (e.g., polynomial features).
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        feature_cols (List[str]): Columns to engineer.
+        degree (int): Polynomial degree.
+
+    Returns:
+        pd.DataFrame: Updated DataFrame with new features.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
+
     try:
         poly = PolynomialFeatures(degree=degree, include_bias=False)
         X = df[feature_cols].fillna(0)
@@ -459,15 +651,32 @@ def auto_feature_engineering(df: pd.DataFrame, feature_cols: List[str], degree: 
         return df
 
 def train_ml_model(df: pd.DataFrame, target_col: str, feature_cols: List[str], task_type: str = "classification", model_type: str = "RandomForest") -> Tuple[Optional[object], float, Optional[object], Optional[np.ndarray], Optional[pd.DataFrame]]:
-    """Train an ML model."""
+    """
+    Train an ML model with dynamic hyperparameter tuning.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        target_col (str): Target column.
+        feature_cols (List[str]): Feature columns.
+        task_type (str): Task type ("classification" or "regression").
+        model_type (str): Model type ("RandomForest", "XGBoost", "LightGBM").
+
+    Returns:
+        Tuple: (model, score, explainer, shap_values, X_test).
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, f"Trained {model_type} model for {task_type} task")
+
     try:
         X = df[feature_cols].fillna(0)
         y = df[target_col].fillna(0)
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
         if model_type == "RandomForest":
             if task_type == "classification":
                 model = RandomForestClassifier(random_state=42)
@@ -483,22 +692,60 @@ def train_ml_model(df: pd.DataFrame, target_col: str, feature_cols: List[str], t
                     'max_depth': [10, 20, 30, None],
                     'min_samples_split': [2, 5, 10]
                 }
+        elif model_type == "XGBoost":
+            import xgboost as xgb
+            if task_type == "classification":
+                model = xgb.XGBClassifier(random_state=42, use_label_encoder=False, eval_metric='logloss')
+                param_grid = {
+                    'n_estimators': [50, 100, 200],
+                    'max_depth': [3, 6, 10],
+                    'learning_rate': [0.01, 0.1, 0.3]
+                }
+            else:
+                model = xgb.XGBRegressor(random_state=42)
+                param_grid = {
+                    'n_estimators': [50, 100, 200],
+                    'max_depth': [3, 6, 10],
+                    'learning_rate': [0.01, 0.1, 0.3]
+                }
+        elif model_type == "LightGBM":
+            if task_type == "classification":
+                model = lgb.LGBMClassifier(random_state=42)
+                param_grid = {
+                    'n_estimators': [50, 100, 200],
+                    'max_depth': [3, 6, 10],
+                    'learning_rate': [0.01, 0.1, 0.3]
+                }
+            else:
+                model = lgb.LGBMRegressor(random_state=42)
+                param_grid = {
+                    'n_estimators': [50, 100, 200],
+                    'max_depth': [3, 6, 10],
+                    'learning_rate': [0.01, 0.1, 0.3]
+                }
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
+
         grid_search = GridSearchCV(model, param_grid, cv=5, scoring='accuracy' if task_type == "classification" else 'r2', n_jobs=-1)
         grid_search.fit(X_train, y_train)
+        
         best_model = grid_search.best_estimator_
         score = best_model.score(X_test, y_test)
+        
         explainer = None
         shap_values = None
         try:
             import shap
-            explainer = shap.TreeExplainer(best_model)
+            if model_type == "RandomForest":
+                explainer = shap.TreeExplainer(best_model)
+            else:
+                explainer = shap.KernelExplainer(best_model.predict, X_test)
             shap_values = explainer.shap_values(X_test)
         except ImportError:
-            logger.warning("SHAP library not installed.")
+            logger.warning("SHAP library not installed. Feature importance plots will not be available.")
         except Exception as e:
-            logger.warning(f"SHAP computation failed: {str(e)}.")
+            logger.warning(f"SHAP computation failed: {str(e)}. Proceeding without feature importance.")
+        
         joblib.dump(best_model, "model.pkl")
         return best_model, score, explainer, shap_values, X_test
     except Exception as e:
@@ -506,11 +753,25 @@ def train_ml_model(df: pd.DataFrame, target_col: str, feature_cols: List[str], t
         return None, 0, None, None, None
 
 def perform_clustering(df: pd.DataFrame, feature_cols: List[str], n_clusters: int = 3) -> np.ndarray:
-    """Perform clustering."""
+    """
+    Perform clustering on the dataset.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        feature_cols (List[str]): Columns to cluster.
+        n_clusters (int): Number of clusters.
+
+    Returns:
+        np.ndarray: Cluster labels.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, f"Performed clustering with {n_clusters} clusters")
+
     try:
         X = df[feature_cols].fillna(0)
         model = KMeans(n_clusters=n_clusters, random_state=42)
@@ -521,62 +782,75 @@ def perform_clustering(df: pd.DataFrame, feature_cols: List[str], n_clusters: in
         return np.zeros(len(df))
 
 def generate_ml_app(df: pd.DataFrame, target_col: str, feature_cols: List[str]) -> str:
-    """Generate a Dash app script for the trained model."""
+    """
+    Generate a Streamlit app script for the trained model.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        target_col (str): Target column.
+        feature_cols (List[str]): Feature columns.
+
+    Returns:
+        str: Success or error message.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
+
     try:
         app_code = f"""
-import dash
-import dash_core_components as dcc
-import dash_html_components as html
+import streamlit as st
 import pandas as pd
 import joblib
 
-app = dash.Dash(__name__)
 model = joblib.load("model.pkl")
 
-app.layout = html.Div([
-    html.H1("Predict {target_col}"),
-    html.Div([
-        html.Label("{col}"),
-        dcc.Input(id='{col}', type='number', value=0.0),
-    ]) for col in {feature_cols},
-    html.Button("Predict", id="predict_button"),
-    html.Div(id="prediction_output")
-])
+st.title("Predict {target_col}")
 
-@app.callback(
-    dash.dependencies.Output("prediction_output", "children"),
-    [dash.dependencies.Input("predict_button", "n_clicks")],
-    [dash.dependencies.State('{col}', 'value') for col in {feature_cols}]
-)
-def update_prediction(n_clicks, *inputs):
-    if n_clicks is None:
-        return ""
-    df = pd.DataFrame([{{ col: val for col, val in zip({feature_cols}, inputs) }}])
-    prediction = model.predict(df)[0]
-    return f"Predicted {target_col}: {{prediction}}"
-
-if __name__ == "__main__":
-    app.run_server(debug=True)
+inputs = {{}}
+"""
+        for col in feature_cols:
+            app_code += f"inputs['{col}'] = st.number_input('{col}', value=0.0)\n"
+        
+        app_code += f"""
+df = pd.DataFrame([inputs])
+prediction = model.predict(df)[0]
+st.write(f"Predicted {target_col}: {{prediction}}")
 """
         with open("predictor_app.py", "w") as f:
             f.write(app_code)
-        return "predictor_app.py generated! Run it with 'python predictor_app.py'"
+        return "predictor_app.py generated! Run it with 'streamlit run predictor_app.py'"
     except Exception as e:
         logger.error(f"Error in generate_ml_app: {str(e)}")
         return f"Error: Failed to generate ML app - {str(e)}"
 
-def chat_with_gpt(df: pd.DataFrame, message: str, max_tokens: int = 100, username: str = 'anonymous') -> str:
-    """Chat with GPT about the dataset."""
+def chat_with_gpt(df: pd.DataFrame, message: str, max_tokens: int = 100) -> str:
+    """
+    Chat with GPT about the dataset, with identity response for relevant questions.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        message (str): User message.
+        max_tokens (int): Maximum tokens for the response.
+
+    Returns:
+        str: Response from GPT.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, "Used AI chat assistant")
-    if not AI_AVAILABLE:
-        return "OpenAI API key not configured."
+
+    if not client:
+        return "Please configure a valid OpenAI API key to enable AI chat features."
+    
     identity_keywords = ["who are you", "what are you", "who created you", "what's your name"]
     if any(keyword in message.lower() for keyword in identity_keywords):
         return "I’m your data assistant, built for data analysis. How can I assist you today?"
+    
     try:
         analysis = analyze_dataset(df)
         prompt = """
@@ -603,29 +877,48 @@ def chat_with_gpt(df: pd.DataFrame, message: str, max_tokens: int = 100, usernam
         return f"Error: Failed to process chat - {str(e)}"
 
 def suggest_workflow(df: pd.DataFrame) -> List[str]:
-    """Suggest an automated workflow."""
+    """
+    Suggest an automated workflow for the dataset.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+
+    Returns:
+        List[str]: Workflow steps.
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, "Suggested workflow")
-    if not AI_AVAILABLE:
-        return ["OpenAI API key not configured."]
+
+    if not client:
+        return ["Please configure a valid OpenAI API key for automated workflow suggestions."]
+
     try:
         analysis = analyze_dataset(df)
         suggestions = get_cleaning_suggestions(df)
         workflow = []
+        
         for suggestion, explanation in suggestions:
             workflow.append(f"Step: {suggestion} - Reason: {explanation}")
+        
         if analysis["cat_cols"]:
             workflow.append("Step: Encode categorical columns - Reason: Prepares data for ML modeling.")
         if len(analysis["numeric_cols"]) >= 2:
             workflow.append("Step: Generate polynomial features - Reason: Enhances model performance.")
+        
         if analysis["numeric_cols"]:
             workflow.append("Step: Train a predictive model - Reason: Enables forecasting and insights.")
+        
         if len(analysis["numeric_cols"]) >= 2:
             workflow.append("Step: Perform clustering - Reason: Identifies natural groupings in the data.")
+        
         viz_type, viz_reason = suggest_visualization(df)
         workflow.append(f"Step: Create a {viz_type} chart - Reason: {viz_reason}")
+        
         return workflow
     except Exception as e:
         logger.error(f"Error in suggest_workflow: {str(e)}")
@@ -648,17 +941,45 @@ def apply_cleaning_operations(
     target_col: Optional[str] = None,
     feature_cols: Optional[List[str]] = None
 ) -> Tuple[pd.DataFrame, List[str]]:
-    """Apply cleaning operations."""
+    """
+    Apply selected cleaning operations to the dataset with improved logic, including custom rules.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame.
+        selected_suggestions (List[Tuple[str, str]]): AI suggestions to apply.
+        columns_to_drop (List[str]): Columns to drop.
+        options (Dict[str, str]): Cleaning options.
+        replace_value (str): Value to replace.
+        replace_with (str): Replacement value.
+        replace_scope (str): Scope of replacement.
+        encode_cols (List[str]): Columns to encode.
+        encode_method (str): Encoding method.
+        auto_clean (bool): Whether to auto-apply suggestions.
+        enrich_col (Optional[str]): Column to enrich.
+        enrich_api_key (Optional[str]): API key for enrichment.
+        train_ml (bool): Whether to train an ML model.
+        target_col (Optional[str]): Target column for ML.
+        feature_cols (Optional[List[str]]): Feature columns for ML.
+
+    Returns:
+        Tuple[pd.DataFrame, List[str]]: (Cleaned DataFrame, logs).
+    """
+    # Decrypt DataFrame if encrypted
     if isinstance(df, bytes):
         df = decrypt_dataframe(df)
-    username = 'anonymous'
+
+    # Log action
+    username = st.session_state.get('username', 'anonymous')
     log_action(username, "Applied cleaning operations")
+
     cleaned_df = df.copy()
     logs = []
+
     try:
         if columns_to_drop:
             cleaned_df.drop(columns=columns_to_drop, inplace=True, errors='ignore')
             logs.append(f"Dropped columns: {columns_to_drop}")
+
         if replace_value and replace_with is not None:
             if not replace_value.strip():
                 logs.append("No value provided for replacement.")
@@ -671,6 +992,7 @@ def apply_cleaning_operations(
                 replace_count = 0
                 for col in target_cols:
                     try:
+                        # Case-insensitive and exact match for replacement
                         col_values = cleaned_df[col].astype(str).str.lower()
                         replace_value_lower = str(replace_value).lower()
                         matches = col_values == replace_value_lower
@@ -685,6 +1007,7 @@ def apply_cleaning_operations(
                         logs.append(f"Failed to replace '{replace_value}' in column {col}: {str(e)}")
                 logs.append(f"Replaced '{replace_value}' with '{replace_with}' in {replace_scope} ({replace_count} instances)" if replace_count > 0 else
                             f"No instances of '{replace_value}' found in {replace_scope}")
+
         if encode_cols:
             le = LabelEncoder()
             for col in encode_cols:
@@ -697,9 +1020,11 @@ def apply_cleaning_operations(
                         logs.append(f"Converted {col} to numerical using One-Hot Encoding")
                 else:
                     logs.append(f"Column {col} not found or not categorical for encoding")
+
         if enrich_col:
             cleaned_df, enrich_log = enrich_with_geolocation(cleaned_df, enrich_col, enrich_api_key)
             logs.append(enrich_log)
+
         suggestions_to_apply = [(s, e) for s, e in get_cleaning_suggestions(df)] if auto_clean else selected_suggestions
         for suggestion, explanation in suggestions_to_apply:
             if "Replace '?' with NaN" in suggestion:
@@ -708,6 +1033,7 @@ def apply_cleaning_operations(
                     logs.append(f"Replaced all '?' with NaN - {explanation}")
                 else:
                     logs.append(f"No '?' found to replace - {explanation}")
+            
             elif "Handle special characters" in suggestion:
                 special_cols = [col for col in cleaned_df.columns if any(c in col for c in "#@$%^&* ()")]
                 if special_cols:
@@ -716,10 +1042,12 @@ def apply_cleaning_operations(
                         cleaned_df.drop(columns=special_cols, inplace=True)
                         logs.append(f"Dropped columns with special characters: {special_cols} - {explanation}")
                     else:
+                        # Replace special characters with underscores in a more robust way
                         cleaned_df.columns = [re.sub(r'[#@$%^&* ()]', '_', col) for col in cleaned_df.columns]
                         logs.append(f"Replaced special characters with underscores in column names - {explanation}")
                 else:
                     logs.append(f"No special character columns found - {explanation}")
+            
             elif "Remove fully empty rows" in suggestion:
                 empty_rows = cleaned_df.isna().all(axis=1)
                 if empty_rows.any():
@@ -727,6 +1055,7 @@ def apply_cleaning_operations(
                     logs.append(f"Dropped {empty_rows.sum()} empty rows - {explanation}")
                 else:
                     logs.append(f"No fully empty rows found - {explanation}")
+            
             elif "Fill missing values" in suggestion:
                 col = extract_column(suggestion)
                 if col and col in cleaned_df.columns and cleaned_df[col].isna().any():
@@ -746,6 +1075,7 @@ def apply_cleaning_operations(
                         logs.append(f"Filled missing values in {col} with mode - {explanation}")
                 else:
                     logs.append(f"No missing values to fill in {col or 'specified column'} - {explanation}")
+            
             elif "Encode categorical column" in suggestion:
                 col = extract_column(suggestion)
                 if col and col in cleaned_df.columns and cleaned_df[col].dtype in ['object', 'category']:
@@ -753,6 +1083,7 @@ def apply_cleaning_operations(
                     logs.append(f"Encoded categorical column: {col} - {explanation}")
                 else:
                     logs.append(f"No categorical column {col or 'specified'} to encode - {explanation}")
+            
             elif "Remove duplicate rows" in suggestion:
                 initial_rows = len(cleaned_df)
                 cleaned_df.drop_duplicates(inplace=True)
@@ -761,6 +1092,7 @@ def apply_cleaning_operations(
                     logs.append(f"Removed {rows_dropped} duplicate rows - {explanation}")
                 else:
                     logs.append(f"No duplicate rows found - {explanation}")
+            
             elif "Handle outliers" in suggestion:
                 col = extract_column(suggestion)
                 if col and col in cleaned_df.columns and cleaned_df[col].dtype in ['int64', 'float64']:
@@ -777,11 +1109,13 @@ def apply_cleaning_operations(
                         logs.append(f"No outliers in {col} - {explanation}")
                 else:
                     logs.append(f"No numeric column {col or 'specified'} for outlier handling - {explanation}")
+            
             elif "Interpolate time series" in suggestion:
                 col = extract_column(suggestion)
                 if col and col in cleaned_df.columns and pd.api.types.is_datetime64_any_dtype(cleaned_df.index):
                     cleaned_df = interpolate_time_series(cleaned_df, col)
                     logs.append(f"Interpolated time series in {col} - {explanation}")
+            
             elif "Convert column" in suggestion:
                 col = extract_column(suggestion)
                 if col and col in cleaned_df.columns:
@@ -795,6 +1129,7 @@ def apply_cleaning_operations(
                             logs.append(f"Converted column {col} to string - {explanation}")
                     except Exception as e:
                         logs.append(f"Failed to convert column {col} to {suggested_type}: {str(e)} - {explanation}")
+
         if train_ml and target_col and feature_cols:
             cleaned_df = auto_feature_engineering(cleaned_df, feature_cols)
             feature_cols = [col for col in cleaned_df.columns if col != target_col]
@@ -804,6 +1139,7 @@ def apply_cleaning_operations(
                 logs.append(f"Trained ML model with accuracy {score:.2f}. Generated app at {app_path}")
             else:
                 logs.append("ML model training failed.")
+
         return cleaned_df, logs
     except Exception as e:
         logger.error(f"Error in apply_cleaning_operations: {str(e)}")
