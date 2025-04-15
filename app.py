@@ -405,7 +405,7 @@ def login_layout(theme):
             ),
             dbc.Button("Sign Up", id="signup_button", color="secondary", className="w-100"),
             html.Div(id="login_error", className="text-danger text-center mt-3")
-        ], className="card mx-auto mt-5", style={'maxWidth symmetrize your code to make it look cleaner and more readable.'400px'})
+        ], className="card mx-auto mt-5", style={'maxWidth': '400px'})
     ], className=f"{theme}-theme")
 
 def signup_layout(theme):
