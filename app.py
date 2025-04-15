@@ -619,7 +619,7 @@ def update_google_auth_url(pathname, session):
     State("chart_title", "value"),
     State("add_to_dashboard", "value"),
     State("task_type", "value"),
-    State("target_col", "value"),
+    State("target_col", "value"),  # Keep only one target_col
     State("feature_cols", "value"),
     State("model_type", "value"),
     State("cluster_cols", "value"),
@@ -640,8 +640,7 @@ def update_google_auth_url(pathname, session):
     State("values_col", "value"),
     State("selected_cols", "value"),
     State("source_col", "value"),
-    State("target_col", "value"),
-    State("weight_col", "value"),
+    State("weight_col", "value"),  # Removed duplicate target_col
     State("time_col", "value"),
     State("event_col", "value"),
     State("start_col", "value"),
@@ -693,7 +692,7 @@ def update_app(
     filename, viz_type, chart_title, add_to_dashboard, task_type, target_col, feature_cols,
     model_type, cluster_cols, n_clusters, x_col, y_col, hue_col, z_col, size_col, color_col,
     lat_col, lon_col, periods, freq, geo_col, value_col, path_cols, values_col, selected_cols,
-    source_col, target_col, weight_col, time_col, event_col, start_col, end_col, task_col,
+    source_col, weight_col, time_col, event_col, start_col, end_col, task_col,
     date_col, group_col, text_col, max_value, stages_col, measure_col, export_format,
     columns_to_drop, replace_value, replace_with, replace_with_custom, replace_scope,
     encode_cols, encode_method, enrich_col, enrich_api_key, anomaly_cols, contamination,
@@ -701,6 +700,7 @@ def update_app(
     suggestion_values, special_chars_opts, fill_opts, outlier_opts, rule_cols, rule_conds,
     rule_thresholds, rule_actions, rule_action_values, session
 ):
+
     ctx = dash.callback_context
     if not ctx.triggered:
         raise PreventUpdate
